@@ -1,3 +1,6 @@
+《核对报告》
+- 代码仓库地址：原稿写为 “https://github.com/jiajie-ma/STDFusionNet”。【❌与原文不一致】论文摘要中给出的仓库是 “https://github.com/jiayi-ma/STDFusionNet”；已在正文更正为论文版本。建议改写为：“代码： https://github.com/jiayi-ma/STDFusionNet”。（证据：`paper_text.txt` 第 1 行包含“https://g ithub .c o m /jia y i -m a / STDFusio nNe t”，对应论文摘要。）
+
 <!-- 原论文 Fig. 3（带题注）：Architecture of STDFusionNet（总体框架 + ResBlock局部结构；注意题注说明：mask仅训练期用于构造loss，测试期不输入网络） -->
 ![原论文 Fig. 3 占位图：STDFusionNet总体结构 + ResBlock局部结构](TODO: paste Fig.3 screenshot here)
 
@@ -7,7 +10,7 @@
 - 期刊：**IEEE Transactions on Instrumentation and Measurement**, Vol. 70, 2021（Art. no. 5009513）  
 - 作者：Jiayi Ma, Linfeng Tang, Meilong Xu, Hao Zhang, Guobao Xiao  
 - DOI：10.1109/TIM.2021.3075747  
-- 代码： https://github.com/jiajie-ma/STDFusionNet  
+- 代码： https://github.com/jiayi-ma/STDFusionNet  
 - Index Terms：Deep learning; image fusion; infrared image; mask; salient target detection  
 :contentReference[oaicite:0]{index=0}
 
@@ -196,86 +199,179 @@
 
 > 这一部分把 Fig.3 中“上半部分网络前向”与“下半部分mask分区loss”拼成可实现的流程；占位代码仅对应论文明确描述的组件。
 
+**数据预处理（归一化到 [-1,1]、裁剪 stride=24、patch=128×128；测试不裁剪）**  
+来自 `utils.input_setup` 和 `train.py`，commit `3e123e59e7517205318acf0a49eb126d045f7312`。训练时每张源图/掩码都按 stride=24 滑窗裁成 128×128 patch，并用 `(imread(...) - 127.5)/127.5` 归一化到 [-1,1]；测试分支（未在本仓脚本启用）保留整图尺寸。  
+```python
+def input_setup(sess, config, data_dir, index=0):
+    if config.is_train:
+        data = prepare_data(sess, dataset=data_dir)
+    else:
+        data = prepare_data(sess, dataset=data_dir)
+
+    sub_input_sequence = []
+
+    if config.is_train:
+        for i in range(len(data)):
+            input_ = (imread(data[i]) - 127.5) / 127.5
+            if len(input_.shape) == 3:
+                h, w, _ = input_.shape
+            else:
+                h, w = input_.shape
+            for x in range(0, h - config.image_size + 1, config.stride):
+                for y in range(0, w - config.image_size + 1, config.stride):
+                    sub_input = input_[x:x + config.image_size, y:y + config.image_size]
+                    sub_input = sub_input.reshape([config.image_size, config.image_size, 1])
+                    sub_input_sequence.append(sub_input)
+    ...
+```
+- 对齐注释：`config.image_size=128`、`config.stride=24`（见 5.5 训练脚本）；对应论文训练细节“crop 128×128 with stride 24 得到 6921 patch”与“输入归一化到 [-1,1]”，以及 Fig.3 左侧输入节点尺寸保持不变（无下采样）。
+- 可见/红外/掩码都通过 `input_setup(..., "Train_vi") / ("Train_ir") / ("Train_ir_mask_blur")` 进入 `train()`（见 5.5），与 Fig.3 下半部分“mask 仅用于 loss 构造”保持一致。
+
 ### 5.1 前向传播（Inference / Training都需要）
 
 ```python
-# TODO(STDFusionNet): build Feature Extraction Network (pseudosiamese: same architecture, independent params)
-# - common layer: Conv(5x5) + LeakyReLU
-# - 3 x ResBlock
-# return: conv features for infrared branch and visible branch
+class STDFusionNet:
+    def vi_feature_extraction_network(self, vi_image):
+        with tf.compat.v1.variable_scope('vi_extraction_network'):
+            with tf.compat.v1.variable_scope('conv1'):
+                weights = tf.compat.v1.get_variable("w", [5, 5, 1, 16],
+                                                    initializer=tf.truncated_normal_initializer(stddev=1e-3))
+                bias = tf.compat.v1.get_variable("b", [16], initializer=tf.constant_initializer(0.0))
+                conv1 = tf.nn.conv2d(vi_image, weights, strides=[1, 1, 1, 1], padding='SAME') + bias
+                conv1 = tf.nn.leaky_relu(conv1)
+            block1_input = conv1
+            ...  # ResBlock ×3（见下节）
+        return encoding_feature
 
-def feature_extractor_visible(I_vi):
-    raise NotImplementedError
+    def ir_feature_extraction_network(self, ir_image):
+        with tf.compat.v1.variable_scope('ir_extraction_network'):
+            ...  # 与上完全同构，但参数独立
+        return encoding_feature
 
-def feature_extractor_infrared(I_ir):
-    raise NotImplementedError
+    def feature_reconstruction_network(self, feature):
+        with tf.compat.v1.variable_scope('reconstruction_network'):
+            block1_input = feature
+            ...  # ResBlock ×4
+            block4_output = tf.nn.tanh(conv3 + identity_conv)
+            fusion_image = block4_output
+        return fusion_image
 
-
-# TODO(STDFusionNet): build Feature Reconstruction Network
-# - input: concat([feat_ir, feat_vi], axis=channel)
-# - 4 x ResBlock
-# - last layer activation: Tanh
-def feature_reconstructor(feat_ir, feat_vi):
-    raise NotImplementedError
-
-
-# TODO(STDFusionNet): forward
-# If = reconstructor(extractor_ir(Iir), extractor_vi(Ivi))
-def forward(I_ir, I_vi):
-    raise NotImplementedError
+    def STDFusion_model(self, vi_image, ir_image):
+        with tf.variable_scope("STDFusion_model"):
+            vi_feature = self.vi_feature_extraction_network(vi_image)
+            ir_feature = self.ir_feature_extraction_network(ir_image)
+            feature = tf.concat([vi_feature, ir_feature], axis=-1)
+            f_image = self.feature_reconstruction_network(feature)
+        return f_image
 ```
+- 代码来源：`train_network.py`，commit `3e123e59e7517205318acf0a49eb126d045f7312`。
+- 对齐注释：
+  - `vi_feature_extraction_network` / `ir_feature_extraction_network`：对应 Fig.3 顶部两条 **pseudosiamese** 分支（同构不同参数）。`conv1` 为 Fig.3 中的 “Conv 5×5 + lrelu”（common layer），后续 `block1/2/3` 为 “ResBlock×3”。
+  - `feature_reconstruction_network`：对应 Fig.3 右上虚线框 “Feature Reconstruction Network” 的 4 个 ResBlock，`tf.concat([...], axis=-1)` 对应 Fig.3 中红外/可见特征的 **channel concat** 箭头。
+  - `tf.nn.tanh` 终层与论文“最后一层使用 Tanh 以保证输出范围与输入一致”逐点对齐；所有卷积 `padding='SAME'`, `strides=[1,1,1,1]` 对应 “无下采样、保持尺寸”。
+  - `STDFusion_model`：前向 `If = R( concat( F_ir(Iir), F_vi(Ivi) ) )`，对应 Fig.3 顶部整体流程。
 
 ### 5.2 ResBlock 占位（严格对应 Fig.3 局部结构）
 
 ```python
-# TODO(STDFusionNet): ResBlock as in Fig.3
-# Main path: Conv1(1x1) -> LeakyReLU -> Conv2(3x3) -> LeakyReLU -> Conv3(1x1)
-# Skip path: identity Conv(1x1)
-# Sum -> LeakyReLU
+with tf.compat.v1.variable_scope('block2'):
+    with tf.compat.v1.variable_scope('conv1'):
+        weights = tf.compat.v1.get_variable("w", [1, 1, 16, 16],
+                                            initializer=tf.truncated_normal_initializer(stddev=1e-3))
+        bias = tf.compat.v1.get_variable("b", [16], initializer=tf.constant_initializer(0.0))
+        conv1 = tf.nn.conv2d(block2_input, weights, strides=[1, 1, 1, 1], padding='SAME') + bias
+        conv1 = tf.nn.leaky_relu(conv1)
 
-def resblock(x):
-    raise NotImplementedError
+    with tf.compat.v1.variable_scope('conv2'):
+        weights = tf.compat.v1.get_variable("w", [3, 3, 16, 16],
+                                            initializer=tf.truncated_normal_initializer(stddev=1e-3))
+        bias = tf.compat.v1.get_variable("b", [16], initializer=tf.constant_initializer(0.0))
+        conv2 = tf.nn.conv2d(conv1, weights, strides=[1, 1, 1, 1], padding='SAME') + bias
+        conv2 = tf.nn.leaky_relu(conv2)
+    with tf.compat.v1.variable_scope('conv3'):
+        weights = tf.compat.v1.get_variable("w", [1, 1, 16, 32],
+                                            initializer=tf.truncated_normal_initializer(stddev=1e-3))
+        bias = tf.compat.v1.get_variable("b", [32], initializer=tf.constant_initializer(0.0))
+        conv3 = tf.nn.conv2d(conv2, weights, strides=[1, 1, 1, 1], padding='SAME') + bias
+    with tf.variable_scope('identity_conv'):
+        weights = tf.compat.v1.get_variable("w", [1, 1, 16, 32],
+                                            initializer=tf.truncated_normal_initializer(stddev=1e-3))
+        identity_conv = tf.nn.conv2d(block2_input, weights, strides=[1, 1, 1, 1], padding='SAME')
+    block2_output = tf.nn.leaky_relu(conv3 + identity_conv)
 ```
+- 代码来源：`train_network.py`（可见分支 block2 示意，红外与重建分支结构同型），commit `3e123e59e7517205318acf0a49eb126d045f7312`。
+- 对齐注释：
+  - “主分支”Conv1/Conv2/Conv3 核大小依次 1×1、3×3、1×1，Conv1/Conv2 后接 leaky ReLU；“旁路” identity conv 为 1×1，用于通道升维（16→32）。
+  - `conv3 + identity_conv` 后整体再过 `leaky_relu`，对应 Fig.3 ResBlock 底部 “+” 后接 lrelu。
+  - kernel padding=‘SAME’、stride=1 保持尺寸，对应论文“无下采样”。
 
 ### 5.3 Sobel 梯度算子占位（对应式(4)(5)中的 ∇，论文写用 Sobel operator）
 
 ```python
-# TODO(STDFusionNet): compute gradient using Sobel operator (paper states ∇ implemented by Sobel)
-def sobel_gradient(I):
-    raise NotImplementedError
+def gradient(input):
+    filter1 = tf.reshape(tf.constant([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]), [3, 3, 1, 1])
+    filter2 = tf.reshape(tf.constant([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]]), [3, 3, 1, 1])
+    Gradient1 = tf.nn.conv2d(input, filter1, strides=[1, 1, 1, 1], padding='SAME')
+    Gradient2 = tf.nn.conv2d(input, filter2, strides=[1, 1, 1, 1], padding='SAME')
+    Gradient = tf.abs(Gradient1) + tf.abs(Gradient2)
+    return Gradient
 ```
+- 代码来源：`utils.py`，commit `3e123e59e7517205318acf0a49eb126d045f7312`。
+- 对齐注释：`filter1/filter2` 正是 Sobel 水平/垂直核，对应论文“we employ the Sobel operator to compute the gradient”；`Gradient` 即公式中的 \(\nabla I\)，用于 Eq.(4)(5) 的区域梯度损失。
 
 ### 5.4 Loss 计算占位（对应式(2)-(6)，含 mask 分区）
 
 ```python
-# TODO(STDFusionNet): compute region losses and total loss
-# Given:
-# - Im: salient target mask (binary)
-# - (1-Im): background mask (inverted)
-# - If: fused image
-# - Iir/Ivi: source images
-# Pixel losses: Eq.(2)(3)
-# Grad losses: Eq.(4)(5) with Sobel gradients
-# Total: Eq.(6) with alpha
+with tf.name_scope('g_loss'):
+    self.ir_mask = (self.ir_mask + 1) / 2.0
+    self.ir_p_loss_train = tf.multiply(self.ir_mask, tf.abs(self.fusion_images - self.ir_images))
+    self.vi_p_loss_train = tf.multiply(1 - self.ir_mask, tf.abs(self.fusion_images - self.vi_images))
+    self.ir_grad_loss_train = tf.multiply(self.ir_mask, tf.abs(gradient(self.fusion_images) - gradient(self.ir_images)))
+    self.vi_grad_loss_train = tf.multiply(1 - self.ir_mask, tf.abs(gradient(self.fusion_images) - gradient(self.vi_images)))
 
-def compute_loss(I_ir, I_vi, I_f, I_m, alpha):
-    raise NotImplementedError
+    self.ir_p_loss = tf.reduce_mean(self.ir_p_loss_train)
+    self.vi_p_loss = tf.reduce_mean(self.vi_p_loss_train)
+    self.ir_grad_loss = tf.reduce_mean(self.ir_grad_loss_train)
+    self.vi_grad_loss = tf.reduce_mean(self.vi_grad_loss_train)
+    self.g_loss_2 = 1 * self.vi_p_loss + 1 * self.vi_grad_loss + 7 * self.ir_p_loss + 7 * self.ir_grad_loss
 ```
+- 代码来源：`model.py` 的 `build_model`，commit `3e123e59e7517205318acf0a49eb126d045f7312`。
+- 对齐注释：
+  - `self.ir_mask = (mask+1)/2` 将训练集存储的 [-1,1] 掩码还原为二值 \(\{0,1\}\)（论文 mask 二值化），`1 - self.ir_mask` 对应论文“inverted to obtain the background masks”。
+  - `tf.multiply(self.ir_mask, |If - Iir|)`、`tf.multiply(1 - self.ir_mask, |If - Ivi|)`：对应 Eq.(2)(3) 的 \(I_m \circ I_f - I_m \circ I_{ir}\) 与 \((1-I_m)\circ I_f - (1-I_m)\circ I_{vi}\)，L1 范数由 `tf.abs` + `tf.reduce_mean`（即 \(\frac{1}{HW}\|\cdot\|_1\)）实现。
+  - `gradient(...)` 调用 Sobel（见 5.3），对应 Eq.(4)(5) 中 \(\nabla I\)；同样用显著/背景 mask 做逐元素乘，符合 Fig.3 下半部分“Element-wise Multiplication”节点。
+  - `self.g_loss_2 = vi_pixel + vi_grad + 7*ir_pixel + 7*ir_grad`：对应 Eq.(6) 中背景区域（对应可见图）系数 1，显著区域系数 \(\alpha=7\)；pixel/grad 在同一区域等权相加。
 
 ### 5.5 训练流程占位（对应论文“Training Details”）
 
 ```python
-# TODO(STDFusionNet): training loop placeholder (TensorFlow + Adam in paper)
-# Paper settings:
-# - train on 20 pairs from TNO
-# - crop with stride=24, patch size=128x128, total 6921 patch pairs
-# - normalize source images to [-1, 1]
-# - batch_size=32, iterations=30, lr=1e-3
-# - alpha=7 (to balance salient vs background losses)
-
-def train():
-    raise NotImplementedError
+flags.DEFINE_integer("epoch", 30, "Number of epoch [10]")
+flags.DEFINE_integer("batch_size", 32, "The size of batch images [128]")
+flags.DEFINE_integer("image_size", 128, "The size of image to use [33]")
+flags.DEFINE_integer("stride", 24, "The size of stride to apply input image [14]")
+flags.DEFINE_float("learning_rate", 1e-3, "The learning rate of gradient descent algorithm [1e-4]")
+...
+with tf.name_scope('train_step'):
+    self.train_generator_op = tf.train.AdamOptimizer(config.learning_rate).minimize(self.g_loss_total, var_list=self.g_vars)
+...
+for ep in range(config.epoch):
+    lr = self.init_lr if ep < self.decay_epoch else self.init_lr * (config.epoch - ep) / (config.epoch - self.decay_epoch)
+    batch_idxs = len(train_data_ir) // config.batch_size
+    for idx in range(0, batch_idxs):
+        batch_vi_images = train_data_vi[idx * config.batch_size: (idx + 1) * config.batch_size]
+        batch_ir_images = train_data_ir[idx * config.batch_size: (idx + 1) * config.batch_size]
+        batch_ir_mask = train_data_ir_mask[idx * config.batch_size: (idx + 1) * config.batch_size]
+        batch_ir_mask = (batch_ir_mask + 1.0) / 2.0
+        _, err_g, ... = self.sess.run(
+            [self.train_generator_op, self.g_loss_total, ...],
+            feed_dict={self.vi_images: batch_vi_images, self.ir_images: batch_ir_images,
+                       self.ir_mask: batch_ir_mask, self.lr: lr})
 ```
+- 代码来源：`train.py`（超参定义）与 `model.py`（`STDFusion.train` 循环），commit `3e123e59e7517205318acf0a49eb126d045f7312`。
+- 对齐注释：
+  - `epoch=30`、`batch_size=32`、`learning_rate=1e-3`、`stride=24`、`image_size=128` 与论文训练细节完全一致；`AdamOptimizer` 对应论文“optimizer is Adam in TensorFlow”。
+  - 训练数据由 20 对 TNO 图像（目录 `Train_ir`/`Train_vi` 各 20 张）经 5.1 的裁剪产生 patch（论文统计 6921 对）；测试分支未裁剪，符合“测试不裁剪”。
+  - `batch_ir_mask = (mask+1)/2` 再喂入 loss，与 Fig.3 中 mask 仅用于 loss（不进入网络）一致。
 
 ---
 
